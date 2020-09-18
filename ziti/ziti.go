@@ -17,6 +17,7 @@
 package ziti
 
 import (
+	"crypto/sha1"
 	"crypto/tls"
 	errors2 "errors"
 	"fmt"
@@ -48,6 +49,7 @@ const (
 type Context interface {
 	Authenticate() error
 	Dial(serviceName string) (edge.ServiceConn, error)
+	DialWithOptions(serviceName string, options *edge.DialOptions) (edge.ServiceConn, error)
 	Listen(serviceName string) (edge.Listener, error)
 	ListenWithOptions(serviceName string, options *edge.ListenOptions) (edge.Listener, error)
 	GetServiceId(serviceName string) (string, bool, error)
@@ -318,6 +320,14 @@ func (context *contextImpl) Authenticate() error {
 }
 
 func (context *contextImpl) Dial(serviceName string) (edge.ServiceConn, error) {
+	defaultOptions := &edge.DialOptions{ConnectTimeout: 5 * time.Second}
+	return context.DialWithOptions(serviceName, defaultOptions)
+}
+
+func (context *contextImpl) DialWithOptions(serviceName string, options *edge.DialOptions) (edge.ServiceConn, error) {
+	if options.GetConnectTimeout() == 0 {
+		options.ConnectTimeout = 5 * time.Second
+	}
 	if err := context.initialize(); err != nil {
 		return nil, errors.Errorf("failed to initialize context: (%v)", err)
 	}
@@ -340,7 +350,7 @@ func (context *contextImpl) Dial(serviceName string) (edge.ServiceConn, error) {
 			continue
 		}
 		pfxlog.Logger().Infof("connecting via session id [%s] token [%s]", session.Id, session.Token)
-		conn, err = context.dialSession(serviceName, session)
+		conn, err = context.dialSession(serviceName, session, options)
 		if err != nil {
 			context.deleteServiceSessions(serviceId)
 			continue
@@ -350,13 +360,13 @@ func (context *contextImpl) Dial(serviceName string) (edge.ServiceConn, error) {
 	return nil, errors.Errorf("unable to dial service '%s' (%v)", serviceName, err)
 }
 
-func (context *contextImpl) dialSession(service string, session *edge.Session) (edge.ServiceConn, error) {
-	edgeConnFactory, err := context.getEdgeRouterConn(session, edge.DialConnOptions{})
+func (context *contextImpl) dialSession(service string, session *edge.Session, options *edge.DialOptions) (edge.ServiceConn, error) {
+	edgeConnFactory, err := context.getEdgeRouterConn(session, options)
 	if err != nil {
 		return nil, err
 	}
 	edgeConn := edgeConnFactory.NewConn(service)
-	return edgeConn.Connect(session)
+	return edgeConn.Connect(session, options)
 }
 
 func (context *contextImpl) ensureApiSession() error {
@@ -645,6 +655,7 @@ func (context *contextImpl) Metrics() metrics.Registry {
 
 func newListenerManager(serviceId, serviceName string, context *contextImpl, options *edge.ListenOptions) *listenerManager {
 	now := time.Now()
+
 	listenerMgr := &listenerManager{
 		serviceId:         serviceId,
 		context:           context,
@@ -680,6 +691,12 @@ type listenerManager struct {
 func (mgr *listenerManager) run() {
 	mgr.createSessionWithBackoff()
 	mgr.makeMoreListeners()
+
+	if mgr.options.BindUsingEdgeIdentity {
+		mgr.options.Identity = mgr.context.apiSession.Identity.Id
+		// Use the leaf cert fingerprints as something that should be unique to this identity
+		mgr.options.IdentitySecret = fmt.Sprintf("%x", sha1.Sum(mgr.context.id.Cert().Certificate[0]))
+	}
 
 	ticker := time.NewTicker(250 * time.Millisecond)
 	refreshTicker := time.NewTicker(30 * time.Second)
@@ -725,8 +742,8 @@ func (mgr *listenerManager) createListener(routerConnection edge.RouterConn, ses
 	edgeConn := routerConnection.NewConn(serviceName)
 	listener, err := edgeConn.Listen(session, serviceName, mgr.options)
 	elapsed := time.Now().Sub(start)
-	logger.Debugf("listener established to %v in %vms", routerConnection.Key(), elapsed.Milliseconds())
 	if err == nil {
+		logger.Debugf("listener established to %v in %vms", routerConnection.Key(), elapsed.Milliseconds())
 		mgr.listener.AddListener(listener, func() {
 			mgr.eventChan <- &routerConnectionListenFailedEvent{
 				router: routerConnection.GetRouterName(),
@@ -734,7 +751,7 @@ func (mgr *listenerManager) createListener(routerConnection edge.RouterConn, ses
 		})
 		mgr.eventChan <- listenSuccessEvent{}
 	} else {
-		logger.Errorf("creating listener failed: %v", err)
+		logger.Errorf("creating listener failed after %vms: %v", elapsed.Milliseconds(), err)
 		if err := edgeConn.Close(); err != nil {
 			pfxlog.Logger().Errorf("failed to close edgeConn %v for service '%v' (%v)", edgeConn.Id(), serviceName, err)
 		}

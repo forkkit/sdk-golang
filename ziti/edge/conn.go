@@ -80,7 +80,7 @@ type Conn interface {
 	net.Conn
 	Identifiable
 	NewConn(service string) Conn
-	Connect(session *Session) (ServiceConn, error)
+	Connect(session *Session, options *DialOptions) (ServiceConn, error)
 	Listen(session *Session, serviceName string, options *ListenOptions) (Listener, error)
 	IsClosed() bool
 }
@@ -152,7 +152,7 @@ func (ec *MsgChannel) WriteTraced(data []byte, msgUUID []byte) (int, error) {
 func (ec *MsgChannel) SendState(msg *channel2.Message) error {
 	msg.PutUint32Header(SeqHeader, ec.msgIdSeq.Next())
 	ec.TraceMsg("SendState", msg)
-	syncC, err := ec.SendAndSyncWithPriority(msg, channel2.High)
+	syncC, err := ec.SendAndSyncWithPriority(msg, channel2.Highest)
 	if err != nil {
 		return err
 	}
@@ -186,17 +186,23 @@ type ConnOptions interface {
 	GetConnectTimeout() time.Duration
 }
 
-type DialConnOptions struct{}
+type DialOptions struct {
+	ConnectTimeout time.Duration
+	Identity       string
+}
 
-func (d DialConnOptions) GetConnectTimeout() time.Duration {
-	return 5 * time.Second
+func (d DialOptions) GetConnectTimeout() time.Duration {
+	return d.ConnectTimeout
 }
 
 type ListenOptions struct {
-	Cost           uint16
-	Precedence     Precedence
-	ConnectTimeout time.Duration
-	MaxConnections int
+	Cost                  uint16
+	Precedence            Precedence
+	ConnectTimeout        time.Duration
+	MaxConnections        int
+	Identity              string
+	IdentitySecret        string
+	BindUsingEdgeIdentity bool
 }
 
 func (options *ListenOptions) GetConnectTimeout() time.Duration {
